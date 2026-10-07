@@ -17,7 +17,7 @@ EXIBIR_DOCS = True if AMBIENTE == "DESENVOLVIMENTO" else False
 
 app = FastAPI(
     title="Guardião do Cerrado - API Backend Blindado Completo",
-    version="1.6.1",
+    version="1.6.2",
     docs_url="/docs" if EXIBIR_DOCS else None,
     redoc_url=None
 )
@@ -47,7 +47,6 @@ def verificar_integridade_app(x_app_token: str = Depends(api_key_header)):
             detail="Acesso negado: Origem não homologada ou credencial inválida."
         )
     return True
-
 # --- FUNÇÃO MATEMÁTICA: FÓRMULA DE HAVERSINE ---
 def calcular_distancia_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """Calcula a distância real em quilômetros entre duas coordenadas de GPS."""
@@ -80,7 +79,7 @@ class CadastroJogadorSchema(BaseModel):
     def validar_uf(cls, v: str) -> str:
         uf_maiuscula = v.upper().strip()
         ufs_validas = ["AC", "AL", "AP", "AM", "BA", "CE", "DF", "ES", "GO", "MA", "MT", "MS", "MG", "PA", "PB", "PR", "PE", "PI", "RJ", "RN", "RS", "RO", "RR", "SC", "SP", "SE", "TO"]
-        if uf_maiuscula not in ufs_validas:
+        if uf_maiuscula not in uvs_validas:
             raise ValueError("Unidade Federativa inválida.")
         return uf_maiuscula
 
@@ -118,8 +117,6 @@ class AuditoriaVotoSchema(BaseModel):
         if v not in ["JOGADOR_B", "JOGADOR_C"]:
             raise ValueError("Papel de auditoria inválido.")
         return v
-
-
 # --- ENDPOINTS PROTEGIDOS DE INFRAESTRUTURA ---
 
 @app.get("/", status_code=status.HTTP_200_OK)
@@ -160,7 +157,7 @@ def enviar_cupom(dados: EnvioCupomSchema, x_jogador_id: str = Header(...)):
     if not jogador_id:
         raise HTTPException(status_code=400, detail="Identificador do cabeçalho de rede corrompido.")
 
-    # Algoritmo de Validação de Chave Nacional da SEFAZ - CORREÇÃO DE SINTAXE SEM ASTERISCO
+    # Algoritmo de Validação de Chave Nacional da SEFAZ
     pesos = [4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2]
     try:
         digitos_invertidos = [int(x) for x in reversed(dados.chave_nfe[:43])]
@@ -206,8 +203,64 @@ def enviar_cupom(dados: EnvioCupomSchema, x_jogador_id: str = Header(...)):
         if "duplicate key" in str(e).lower() or "23505" in str(e):
             raise HTTPException(status_code=409, detail="Este cupom fiscal já foi enviado e processado pelo sistema.")
         raise HTTPException(status_code=500, detail="Falha de persistência interna de dados.")
-
 @app.post("/cupons/auditar", status_code=status.HTTP_200_OK, dependencies=[Depends(verificar_integridade_app)])
 def auditar_cupom(dados: AuditoriaVotoSchema, tempo_resposta: float = Header(...)):
     # Defesa Anti-Bot / Anti-OCR Comportamental
     if tempo_resposta < 3.0:
+        raise HTTPException(status_code=403, detail="Acesso recusado: Velocidade de resposta incompatível com humanos.")
+    
+    try:
+        cupom_query = supabase.table("cupons_auditoria").select("valor_a", "municipio_emissao", "cnpj_real", "latitude_a", "longitude_a").eq("chave_nfe", dados.cupom_chave).execute()
+        
+        if not cupom_query.data or len(cupom_query.data) == 0:
+            raise HTTPException(status_code=404, detail="Cupom solicitado não localizado para auditoria.")
+        
+        # Extrai de forma limpa o primeiro dicionário do vetor de retorno
+        cupom_original = cupom_query.data[0]
+
+        # Cerca Geográfica de 10km (Fórmula de Haversine para ambiente de testes no Tocantins)
+        if cupom_original.get("latitude_a") is not None and cupom_original.get("longitude_a") is not None:
+            distancia = calcular_distancia_km(
+                cupom_original["latitude_a"], cupom_original["longitude_a"],
+                dados.latitude_auditor, dados.longitude_auditor
+            )
+            if distancia < 10.0:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Bloqueio de Proximidade: Auditor muito próximo ({distancia:.2f}km). Mínimo exigido: 10km."
+                )
+
+        cnpj_gabarito_limpo = re.sub(r'\D', '', dados.cnpj_gabarito).strip()
+        cnpj_original_limpo = re.sub(r'\D', '', cupom_original["cnpj_real"]).strip()
+
+        match_perfeito = (
+            abs(dados.valor_total_gabarito - cupom_original["valor_a"]) < 0.01 and 
+            dados.municipio_gabarito.lower().strip() == cupom_original["municipio_emissao"].lower().strip() and
+            cnpj_gabarito_limpo == cnpj_original_limpo
+        )
+        
+        coluna_voto = "voto_b" if dados.papel_auditor == "JOGADOR_B" else "voto_c"
+        resultado_voto = "APROVADO" if match_perfeito else "DIVERGENTE"
+        
+        supabase.table("cupons_auditoria").update({coluna_voto: resultado_voto}).eq("chave_nfe", dados.cupom_chave).execute()
+        
+        estado_query = supabase.table("cupons_auditoria").select("voto_b", "voto_c").eq("chave_nfe", dados.cupom_chave).execute()
+        
+        if estado_query.data and len(estado_query.data) > 0:
+            estado_atualizado = estado_query.data[0]
+            voto_b = estado_atualizado.get("voto_b")
+            voto_c = estado_atualizado.get("voto_c")
+
+            if voto_b == "APROVADO" and voto_c == "APROVADO":
+                supabase.table("cupons_auditoria").update({"status": "APROVADO"}).eq("chave_nfe", dados.cupom_chave).execute()
+            elif voto_b == "DIVERGENTE" or voto_c == "DIVERGENTE":
+                if voto_b != "PENDENTE" and voto_c != "PENDENTE":
+                    supabase.table("cupons_auditoria").update({"status": "SUSPEITO_PUNIDO"}).eq("chave_nfe", dados.cupom_chave).execute()
+
+        # Blindagem de Resposta: Retorno unificado que impede Brute Force contra auditorias às cegas
+        return {"status": "PROCESSANDO", "mensagem": "Análise computada com sucesso no ecossistema."}
+        
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=500, detail="Falha interna de consolidação securitária.")
